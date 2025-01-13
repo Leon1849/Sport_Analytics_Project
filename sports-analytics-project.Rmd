@@ -1,0 +1,683 @@
+---
+title: "The Effect of the First Goal in the Football Match Outcome"
+author: Suram Bagratyan, Aram Grigoryan, Tigran Kostanyan, Leonid Sarkisyan, Silva Yeghiazaryan
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The aim of our project is to analyze football match data to evaluate the hypothesis:
+**Scoring the first goal increases the probability of winning the match.**
+
+The data provides information about various events during the game starting from a simple goal and going to red card and foul. It has 941009 events from the biggest 5 European football leagues: England, Spain, Germany, Italy and France from 2011/2012 season to 2016/2017 season.
+
+### Objectives
+Our objectives for the project are the following: 
+- Explore and clean the dataset to extract relevant information.
+- Analyze the relationship between scoring the first goal and match outcomes.
+- Use visualizations to illustrate key insights.
+- Build a different models to quantify the impact of scoring first on winning probability.
+
+### Methodology
+The methodolfy that we will use are the following:
+1. Data Preparation: Filter and clean the data to focus on events like goals and match outcomes.
+2. Visualization: Create charts to understand the timing and impact of the first goal.
+3. Modeling: Build models to test the hypothesis quantitatively.
+
+
+### Data Processing
+
+```{r, echo=F, warning=F, message=F}
+#Load the necessary libraries
+library(ggplot2)
+library(dplyr)
+library(devtools)
+library(caret)
+library(pROC)
+library(gridExtra)
+```
+
+At first we load the data.
+```{r, echo=F}
+# Load the dataset
+football_events <- read.csv("events.csv")
+```
+As the dataset includes unnecessary information as well, we will remove the columns unrelated to the analysis, such as player details or descriptive text to simplify the dataset.
+```{r, echo=F}
+# Remove the unnecessary columns
+football_events <- select(football_events, -c(sort_order, text, event_type, event_type2, player, player2, player_in, player_out, shot_place, location, bodypart, assist_method, situation, fast_break))
+```
+The dataset includes information about different type of events. As we are only interested in the goals and also shots on target to later use for analyzis and model creation, we will remove the events other than these two.
+```{r, echo=F}
+# Filter the dataset for shots that are on target or are goals
+football_events <- football_events %>%
+  filter(shot_outcome == 1 | is_goal == 1) 
+```
+The data does not include any information about how many goals were scored during each game, so we will extract that data from our dataset. This code calculates the total number of goals scored by the home and away teams in each game. By organizing the data this way, we can later determine the winner of each match and analyze the relationship between scoring first and match outcomes.
+```{r, echo=F}
+# Calculate the number of goals for each team in each game
+goals_by_team <- football_events %>%
+  group_by(id_odsp, side) %>%
+  summarise(goals = sum(is_goal, na.rm = TRUE), .groups = 'drop')
+
+# Separate the goals by home (side = 1) and away (side = 2) teams
+home_goals <- goals_by_team %>%
+  filter(side == 1) %>%
+  select(id_odsp, home_goals = goals)
+
+away_goals <- goals_by_team %>%
+  filter(side == 2) %>%
+  select(id_odsp, away_goals = goals)
+
+# Merge home and away goals into a single dataframe
+game_results <- merge(home_goals, away_goals, by = "id_odsp")
+```
+On the later analysis, we will need the number of the shots on target for each game. That is why we add a column that includes the total number of shots on target for each team during each game.
+```{r, echo=F}
+# Filter for shots on target (shot_outcome == 1)
+shots_on_target <- football_events %>%
+  filter(shot_outcome == 1)
+
+# Calculate the total shots on target for each team in each game
+shots_by_team <- shots_on_target %>%
+  group_by(id_odsp, side) %>%
+  summarise(total_shots_on_target = n(), .groups = 'drop')
+
+# Separate the shots on target by home (side = 1) and away (side = 2) teams
+home_shots <- shots_by_team %>%
+  filter(side == 1) %>%
+  select(id_odsp, home_shots_on_target = total_shots_on_target)
+
+away_shots <- shots_by_team %>%
+  filter(side == 2) %>%
+  select(id_odsp, away_shots_on_target = total_shots_on_target)
+
+# Merge home and away shots on target into the game_results dataframe
+game_results <- merge(game_results, home_shots, by = "id_odsp")
+game_results <- merge(game_results, away_shots, by = "id_odsp")
+```
+
+As we need to identify the first goal scoring teams, we filter the dataset to isolate the events where a goal was scored. By doing this, we focus on the necessary moments in the match that directly contribute to the outcome, helping us analyze the timing and impact of goals on winning probability.
+```{r, echo=F}
+# Filter the dataset to keep only the rows where a goal was scored
+goal_events <- football_events %>%
+  filter(is_goal == 1)
+```
+As we are interested in only the first goal of the game game, we identify the first goal scored in each match. By extracting the first goal from each game, we can analyze how it impacts the outcome, particularly whether scoring first increases the likelihood of winning.
+```{r, echo=F}
+# For each match identify the first goal, which team has scored it and if it was home or away team
+first_goals <- goal_events %>%
+  group_by(id_odsp) %>%
+  filter(time == min(time)) %>%
+  ungroup() %>%
+  select(id_odsp, event_team, side, time)
+```
+Based on the data that we have already extracted, we assign a winner to each game based on the number of goals scored by the home and away teams. The winner is determined by comparing the home goals and away goals. In case of a draw, those rows are filtered out. This helps in analyzing whether the team that scores first is more likely to win.
+```{r, echo=F}
+# Add winner column to game_results dataset 
+# If the winner is the home team assign it 1, and 2 if the winner is the away team
+game_results <- game_results %>%
+  mutate(winner = case_when(
+    home_goals > away_goals ~ 1,
+    away_goals > home_goals ~ 2,
+  ))
+
+# Filter the NA values as they are related to the cases when the match ended draw
+game_results <- game_results %>%
+  filter(!is.na(winner))
+```
+To have the first goal and game results information together, we merge the first_goals dataframe (which contains details about the team that scored the first goal) with the game_results dataframe (which contains information about the overall winner of the match). 
+```{r, echo=F}
+# Merge the first_goals dataframe with the game_results dataframe by the game ID
+match_data <- merge(first_goals, game_results, by = "id_odsp") %>%
+    mutate(total_shots_on_target = home_shots_on_target + away_shots_on_target)
+```
+There can be games, when for example the first goal is scored in the 90th minute of the game, so it is quite obvious that the likelihood of the team winning increases simply because there is little time remained for the opponent team to score. To extract this cases, we have thought about some threshold that we can use to test the hypothesis on, and we reached to a conclusion that 50th minute is quite good number because the team has the first half of the game + the first few minutes of the second half and we can say that even if the team scores first during the first 50 minutes the opponent team has quite some time to make a comeback. This is why we filter the dataset to only include matches where the first goal was scored before the 50th minute. 
+```{r, echo=F}
+# Filter the dataset to include only goals scored before the 50th minute
+match_data <- match_data %>%
+  filter(time < 50) %>%
+  mutate(total_goals = home_goals + away_goals) 
+```
+
+As we try to analyze the impact of the first goal on the winning percentage, we creates a new column first_goal_wins that indicates whether the team that scored the first goal went on to win the match. This step helps us directly analyze the relationship between scoring first and winning the match.
+```{r, echo=F}
+# Check if the home or away team scored first and won
+match_data <- match_data %>%
+  group_by(id_odsp) %>%
+  mutate(
+    winner = case_when(
+      home_goals > away_goals ~ 1, # Home team wins
+      away_goals > home_goals ~ 2, # Away team wins
+      TRUE ~ 0  # Draw
+    ),
+    first_goal_wins = case_when(
+      side == winner & total_goals > 0 ~ 1,  # Team scored first and won
+      TRUE ~ 0  # Otherwise
+    )
+  )
+```
+
+Another information that we nay need later is the goal_conversion_rate is created as the ratio of total goals to total shots on target. This metric will help assess the efficiency of teams in converting their shots into goals, which is a key aspect of our analysis.
+```{r, echo=F}
+match_data <- match_data %>%
+    mutate(goal_conversion_rate = total_goals / total_shots_on_target)%>%
+  filter(!is.na(goal_conversion_rate))
+```
+
+We also add a new column is_home_team to the match_data dataset, where 1 indicates a home team and 0 indicates an away team. This categorization is essential for analyzing how home advantage may affect goal conversion rates.
+```{r, echo=F}
+# Add categorical home/away column
+match_data <- match_data %>%
+  mutate(is_home_team = ifelse(side == 1, 1, 0))  # 1 for home, 0 for away
+```
+## Exploratory Data Analysis (EDA)
+
+Now let's explore the data, and see the Distribution of Time of First Goals, and try to detect potential outliers. As we can see, first goals are typically scored early in football matches, with the majority occurring within the first 20 minutes. The histogram highlights a declining frequency of first goals as time progresses, while the boxplot shows a median first goal time around 20 minutes, with most occurring between 10 and 30 minutes. This emphasizes the critical impact of early goals in shaping match outcomes.
+```{r, echo=F, warning=F, message=F}
+distibution_histogram <- ggplot(match_data, aes(x = time)) +
+  geom_histogram(binwidth = 5, fill = "blue", color = "black") +
+  labs(title = "Distribution of the Time of First Goals",
+       x = "Time (minutes)",
+       y = "Frequency") +
+  theme_minimal()
+
+# Create a boxplot to detect potential outliers in the time of first goals
+distribution_boxplot <- ggplot(match_data, aes(y = time)) +
+  geom_boxplot(fill = "orange", color = "black") +
+  labs(title = "Boxplot of the Time of First Goals",
+       y = "Time (minutes)") +
+  theme_minimal()
+
+grid.arrange(distibution_histogram, distribution_boxplot, ncol = 2)
+```
+No Outliers Detected: The boxplot shows a clean range for the time of first goals. There are no data points significantly outside the whiskers (which represent 1.5 times the interquartile range). This implies that the time of first goals is consistently distributed within the observed range.
+
+
+Now let's visualize the count of first goal winners by team type. This bar plot illustrates the relationship between the team scoring the first goal (home or away) and the match outcome. When the **home team scores first** (category "1"), they predominantly win, as shown by the tall red bar. Similarly, when the **away team scores first** (category "2"), they often secure victory, indicated by the green bar. The chart emphasizes the significant advantage of scoring the first goal, with a noticeable home advantage overall.
+```{r, echo=F, warning=F, message=F}
+ggplot(match_data, aes(x = factor(side), fill = factor(winner))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("red", "green"), labels = c("Home Win", "Away Win")) +
+  labs(title = "Count of First Goal Winners by Team",
+       x = "First Goal by (1: Home, 2: Away)",
+       y = "Count",
+       fill = "Match Winner") +
+  theme_minimal()
+
+```
+
+The scatter plot illustrates the relationship between the time of the first goal (in minutes) and the total number of goals scored in a match. Each dot represents a match, with the x-axis showing the time of the first goal and the y-axis indicating the total goals in the game.
+
+The trend line suggests a negative correlation: as the time of the first goal increases, the total number of goals in the match tends to decrease slightly. This pattern indicates that earlier first goals may contribute to higher-scoring games, possibly because scoring early might lead to more aggressive play or open gameplay strategies. However, the overall distribution shows considerable variability, suggesting that while this trend exists, other factors also significantly influence the total number of goals in a match.
+```{r, echo=F, warning=F, message=F}
+ggplot(match_data, aes(x = time, y = total_goals)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Scatter Plot of Time of First Goal vs Total Goals",
+       x = "Time of First Goal (minutes)",
+       y = "Total Goals in Match") +
+  theme_minimal()
+```
+
+
+## Hypothesis Testing
+
+### Chi Squared Test
+
+The results of the Pearson's Chi-squared test with Yates' continuity correction indicate a statistically significant association between the two categorical variables being analyzed (the team scoring the first goal and the match outcome).
+The p-value of 0.001529 indicates a statistically significant relationship between scoring the first goal and the match outcome. This suggests that the two variables (scoring first and winning the match) are not independent. This indicates that teams scoring the first goal are more likely to win.
+```{r, echo=F, warning=F, message=F}
+# Create a contingency table
+contingency_table <- table(match_data$first_goal_wins, match_data$winner)
+
+# Perform the Chi-Square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the results
+print(chi_square_test)
+```
+
+This logistic regression model incorporates additional predictors, such as the number of goals scored by both teams, to evaluate the likelihood of the team scoring the first goal winning the match.
+Intercept (3.81): The positive intercept indicates a strong baseline likelihood of winning for the first-goal scorer, assuming all other predictors are at their reference levels.
+
+Side (-0.87): The negative coefficient suggests that when the away team scores the first goal, their chances of winning are significantly lower compared to the home team scoring the first goal. This reinforces the impact of home advantage.
+
+Time (0.0101): The positive coefficient indicates that scoring the first goal later in the match slightly increases the likelihood of winning. This could imply less time for the opposing team to recover.
+
+Home Shots on Target (0.0292):
+This predictor is not statistically significant (p = 0.13), indicating no strong evidence that home team shots on target directly affect the probability of the first goal leading to a win.
+
+Away Shots on Target (0.0458):
+The positive coefficient suggests that more away shots on target slightly increase the likelihood of the first-goal scorer winning. This could reflect higher overall offensive effectiveness.
+
+Most predictors are statistically significant, with p-values < 0.05, except for home shots on target (p = 0.13).
+
+The logistic model suggests that scoring the first goal increases the likelihood of winning, but this probability is moderated by home advantage, the timing of the goal, and the final match scores. The number of goals scored by the opposing team significantly reduces the first-goal advantage, highlighting the importance of overall match dynamics.
+```{r, echo=F, warning=F, message=F}
+logistic_model <- glm(first_goal_wins ~ side + time + home_shots_on_target + away_shots_on_target + home_goals + away_goals, 
+                      data = match_data, 
+                      family = "binomial")
+
+summary(logistic_model)
+```
+
+With the logistic model, let's predict the probabilities of winning when scoring in the given time of the match. First we split data into training and testing sets for performance evaluation.
+```{r, echo=F, warning=F, message=F}
+set.seed(123)
+train_indices <- sample(1:nrow(match_data), 0.7 * nrow(match_data))
+train_data <- match_data[train_indices, ]
+test_data <- match_data[-train_indices, ]
+```
+
+Then with our model, we make predictions on the test set.
+```{r, echo=F, warning=F, message=F}
+test_data$predicted_prob <- predict(logistic_model, test_data, type = "response")
+
+test_data$predicted_class <- ifelse(test_data$predicted_prob > 0.5, 1, 0)
+```
+
+We use metrics such as the Confusion Matrix to evaluate the model:
+```{r, echo=F, warning=F, message=F}
+table(Predicted = test_data$predicted_class, Actual = test_data$first_goal_wins)
+
+accuracy <- mean(test_data$predicted_class == test_data$first_goal_wins)
+print(accuracy)
+```
+
+The confusion matrix summarizes the performance of the classification model:
+
+#### Metrics:
+- **Accuracy**:  
+  \( \text{Accuracy} = \frac{\text{TP} + \text{TN}}{\text{Total}} = \frac{16 + 1241}{16 + 9 + 237 + 1241} = 0.836 \)  
+  This indicates that the model correctly classified 83.6% of the cases overall.
+
+- **Precision**:  
+  \( \text{Precision} = \frac{\text{TP}}{\text{TP} + \text{FP}} = \frac{1241}{1241 + 9} = 0.993 \)  
+  High precision indicates that most of the cases predicted as positive (1) were correct.
+
+- **Recall** (Positive Class):  
+  \( \text{Recall} = \frac{\text{TP}}{\text{TP} + \text{FN}} = \frac{1241}{1241 + 237} = 0.839 \)  
+  The model identified 83.9% of the actual positive cases.
+
+- **F1-Score**:  
+  \( \text{F1} = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}} \approx 0.91 \)  
+  This metric balances precision and recall.
+The model performs well overall, as indicated by the accuracy (83.6%) and F1-score (0.91).
+
+
+### Predicted Probabilities vs. Predictor Variables
+
+Plot the predicted probability of winning (first_goal_wins) against key predictors like time or side to see the relationship.
+```{r, echo=F, warning=F, message=F}
+match_data$predicted_prob <- predict(logistic_model, match_data, type = "response")
+
+ggplot(match_data, aes(x = time, y = predicted_prob, color = side)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "Predicted Probability of Winning vs. Time of First Goal",
+       x = "Time of First Goal (minutes)",
+       y = "Predicted Probability of Winning") +
+  theme_minimal()
+```
+
+The plot visualizes the relationship between the time of the first goal and the predicted probability of winning, with data points differentiated by the team's side.
+
+Side line consistently shows a higher predicted probability of winning compared to Side 2, indicating a potential advantage for Side 1 in scoring first.
+For both sides, the predicted probability of winning generally increases as the time of the first goal gets closer to the 40th minute, suggesting that scoring later in the first half may improve a team's likelihood of winning.
+Components:
+
+Dots represent individual observations of the predicted probabilities based on the logistic regression model.
+Smooth Curves (LOESS) indicate the trend in the predicted probabilities over time for each side.
+Implications:
+
+Scoring early: Teams that score very early (near the 0-10 minute mark) have lower predicted probabilities, but they are still high (>60%).
+Scoring late: Teams scoring later (closer to the 40th minute) see a more significant increase in predicted probabilities, especially for Side 1.
+
+### Odds Ratios with Confidence Intervals
+
+Display the odds ratios for predictors using a bar chart with confidence intervals.
+
+```{r, echo=F, warning=F, message=F}
+model_summary <- tibble(
+  term = c("Intercept", "Away", "Time of First Goal", "home_shots_on_target", "away_shots_on_target"),
+  estimate = c(10.0225186, 0.3916904, 1.0213727, 0.8989201, 0.9505800),
+  std.error = c(0.178995711, 0.095607899, 0.003560268, 0.017634554, 0.020979223),
+  statistic = c(12.876478, -9.803411, 5.939867, -6.042743, -2.415866),
+  p.value = c(6.105855e-38, 1.088465e-22, 2.852536e-09, 1.515160e-09, 1.569782e-02),
+  conf.low = c(7.0735768, 0.3244909, 1.0143210, 0.8683764, 0.9124265),
+  conf.high = c(14.2711400, 0.4720884, 1.0285817, 0.9305580, 0.9906706)
+)
+
+model_summary$term <- recode(model_summary$term,
+                             "(Intercept)" = "Intercept",
+                             "side1" = "Home",
+                             "side2" = "Away",
+                             "time" = "Time of First Goal")
+
+ggplot(model_summary, aes(x = reorder(term, estimate), y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointrange(color = "steelblue") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") + 
+  coord_flip() +
+  labs(title = "Odds Ratios with Confidence Intervals",
+       x = "Predictor",
+       y = "Odds Ratio") +
+  theme_minimal()
+```
+
+The plot represents the odds ratios for each predictor in the logistic regression model, with confidence intervals visualized as error bars.Each row corresponds to a predictor variable (e.g., Time of First Goal, Away, etc.). Predictors with odds ratios >1 increase the likelihood of winning, while those <1 decrease it.
+Odds Ratios (OR):
+
+Intercept: Represents the baseline odds when all predictors are at their reference levels.
+Away: Indicates the odds of winning for away teams relative to the reference (home teams).
+Time of First Goal: Measures how the timing of the first goal affects the odds of winning.
+Other predictors like home_shots_on_target and away_shots_on_target reflect their influence on the match outcome.
+Confidence Intervals:
+
+Error bars show the 95% confidence intervals around each odds ratio.
+If a confidence interval crosses 1 (indicated by the red dashed line), the predictor is not statistically significant at the 5% level.
+
+Predictors with confidence intervals entirely above or below 1 are statistically significant.
+For example, Away has a confidence interval below 1, suggesting that being the away team decreases the odds of winning.
+Time of First Goal has a small but positive impact on odds, as its confidence interval is above 1.
+
+
+### ROC Curve
+
+3. ROC Curve
+Visualize the model's performance with an ROC curve, showing the trade-off between true positive and false positive rates.
+
+```{r, echo=F, warning=F, message=F}
+roc_curve <- roc(match_data$first_goal_wins, match_data$predicted_prob)
+
+plot(roc_curve, col = "blue", lwd = 2, main = "ROC Curve for Logistic Regression")
+```
+
+The ROC (Receiver Operating Characteristic) curve is a graphical representation of the performance of a binary classification model at various threshold levels.
+
+Y-Axis (Sensitivity): Represents the True Positive Rate (TPR), which is the proportion of actual positives correctly identified.
+X-Axis (1 - Specificity): Represents the False Positive Rate (FPR), which is the proportion of negatives incorrectly classified as positives.
+Interpretation:
+
+The blue curve represents the performance of the logistic regression model.
+The closer the curve is to the top-left corner, the better the model's ability to distinguish between classes.
+A random classifier would follow the diagonal line, which serves as the baseline.
+Key Insight:
+
+The curve's shape indicates the model's discriminative power. For this curve, it shows moderate performance, with some ability to predict winners based on the predictors.
+AUC (Area Under the Curve):
+
+To quantitatively assess the model, the AUC (not shown on the plot) can be calculated. A higher AUC (close to 1) indicates better performance, while an AUC near 0.5 indicates no better performance than random chance.
+
+
+## Hypothesis testing using Ratio of Goals Scored to Shots on Target
+
+Bar chart to compare winning probability based on which team scored the first goal
+Categorizes results into win/loss based on whether the scorer was home or away
+The chart illustrates the winning probability based on the side that scores the first goal. It shows that teams scoring the first goal at home have a significantly higher win count compared to those scoring first away. Additionally, the chart highlights that losses are relatively minimal regardless of the side scoring first, suggesting the first goal plays a crucial role in determining the likelihood of winning.
+```{r, echo=F, warning=F, message=F}
+ggplot(match_data, aes(x = factor(side), fill = factor(winner == side))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("grey", "blue"), labels = c("Loss", "Win")) +
+  labs(title = "Winning Probability Based on First Goal Side",
+       x = "First Goal by (1: Home, 2: Away)",
+       y = "Count",
+       fill = "Win Status") +
+  theme_minimal()
+```
+
+The graph illustrates the relationship between the number of shots on target and the goal conversion rate in football matches. Each point on the graph represents a match, with the position of the point determined by the number of shots on target and the corresponding goal conversion rate for that match. It provides insights into how goal conversion rates and shots on target relate to scoring first and winning matches, thereby supporting our project's objectives of understanding the dynamics of match outcomes and the significance of the first goal in football. This suggests that teams with a higher volume of shots may have a lower efficiency in converting those shots into goals.
+```{r, echo=F, warning=F, message=F}
+ggplot(match_data, aes(x = total_shots_on_target, y = goal_conversion_rate)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Goal Conversion Rate vs Shots on Target",
+       x = "Shots on Target", y = "Goal Conversion Rate")
+```
+ 
+ 
+### Linear Regression Model
+
+```{r, echo=F, warning=F, message=F}
+# Linear Regression Model
+linear_model <- lm(goal_conversion_rate ~ total_shots_on_target + is_home_team + total_goals, 
+                   data = match_data)
+summary(linear_model)
+
+```
+The linear regression model examines the relationship between the goal conversion rate and several predictors: `total_shots_on_target`, `is_home_team`, and `total_goals`.
+
+- **Intercept**: The intercept value of 0.376 indicates that if all predictors were zero, the goal conversion rate would be 37.6%. 
+
+- **Total Shots on Target**: The coefficient of -0.0386816 for `total_shots_on_target` shows a negative relationship with goal conversion rate. This means that for every additional shot on target, the goal conversion rate slightly decreases.
+
+- **Total Goals**: The positive coefficient of 0.1053183 for `total_goals` indicates that each additional goal scored significantly increases the goal conversion rate.
+
+The multiple R-squared value of 0.8829 suggests that the model explains approximately 88.29% of the variance in the goal conversion rate, showing a strong explanatory power.
+
+Overall, the coefficient for total_shots_on_target is -0.0387, which suggests that for each additional shot on target, the goal conversion rate decreases slightly.  The coefficient for total_goals is 0.1053, indicating that for each additional goal scored, the goal conversion rate increases significantly. is_home_team is 0.0017, suggests that being the home team does not have a meaningful impact on the goal conversion rate in this model. The Multiple R-squared value of 0.8829 suggests that approximately 88.29% of the variance in goal conversion rates can be explained by the model, indicating a strong fit.
+The logistic regression model predicts whether a team has an efficient conversion rate or not.
+
+```{r, echo=F, warning=F, message=F}
+# Logistic Regression Model (e.g., predicting if goal_conversion_rate > threshold)
+match_data <- match_data %>%
+  mutate(efficient_conversion = ifelse(goal_conversion_rate > 0.3, 1, 0))  # Threshold of 30%
+
+logistic_model <- glm(efficient_conversion ~ total_shots_on_target + is_home_team + total_goals, 
+                      family = binomial(link = "logit"), data = match_data)
+summary(logistic_model)
+```
+
+The logistic regression model `efficient_conversion ~ total_shots_on_target + is_home_team + total_goals` investigates the factors influencing the efficient conversion rate.
+
+- **Intercept**: The intercept of -19.1902 suggests that when all predictors are at zero, the log-odds of efficient conversion would be extremely low.
+
+- **Total Shots on Target**: The coefficient for `total_shots_on_target` is -111.4327. This suggests that the effect of the total number of shots on target on efficient conversion is not statistically significant, as indicated by a p-value of 0.964.
+
+Overall, the model suggests that while total goals significantly affect efficient conversion, neither the number of shots on target nor being a home team significantly influences the conversion rate in this dataset.
+
+To conclude the models, the results from the linear model indicate that the model is effective in predicting goal conversion rates, which is essential for understanding how scoring first can influence match outcomes. The low MSE suggests that the model captures the underlying patterns in the data well.
+The logistic model's accuracy indicates its effectiveness in classifying matches based on efficient conversion, which is directly related to the hypothesis that scoring first increases the probability of winning. A high accuracy would support the hypothesis, suggesting that teams that score first are more likely to convert their scoring opportunities efficiently.
+
+```{r, echo=F, warning=F, message=F}
+# Linear Model Evaluation
+lm_predictions <- predict(linear_model, newdata = match_data)
+mse <- mean((match_data$goal_conversion_rate - lm_predictions)^2)
+cat("Linear Model Mean Squared Error:", mse, "\n")
+
+# Logistic Model Evaluation
+logistic_predictions <- predict(logistic_model, newdata = match_data, type = "response")
+match_data <- match_data %>%
+  ungroup() %>% 
+  mutate(predicted_class = ifelse(logistic_predictions > 0.5, 1, 0))
+
+# Accuracy and Confusion Matrix
+conf_matrix <- table(match_data$efficient_conversion, match_data$predicted_class)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("Logistic Model Accuracy:", accuracy, "\n")
+```
+
+The analysis likely shows that teams that score first have a significantly higher win rate compared to those that do not. This supports the hypothesis that scoring the first goal increases the probability of winning the match.
+```{r, echo=F, warning=F, message=F}
+# Win rate for teams scoring first
+win_rate_data <- match_data %>%
+  group_by(first_goal_wins) %>%
+  summarise(win_rate = n() / nrow(match_data)) %>%
+  mutate(label = ifelse(first_goal_wins == 1, "Scored First", "Did Not Score First"))
+
+ggplot(win_rate_data, aes(x = label, y = win_rate, fill = label)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  labs(title = "Win Rate for Teams Scoring First vs Not",
+       x = "Scored First Status",
+       y = "Win Rate") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Scored First" = "blue", "Did Not Score First" = "red")) +
+  theme(legend.position = "none")
+```
+
+If the data shows that teams scoring first tend to do so early in the match, it reinforces the idea that scoring first increases the likelihood of winning. This is because the team that scores first can adopt a more defensive strategy, making it harder for the opponent to equalize.
+The timing of the first goal can also affect the psychological aspect of the game. Teams that score first may gain confidence, while the opposing team may feel pressured, which can further influence match outcomes.
+The distribution of first goal times provides empirical evidence to support your hypothesis that scoring the first goal increases the probability of winning. If the majority of first goals occur within the first half, particularly before the 50th minute, it suggests that early scoring is a critical factor in determining match outcomes.
+
+```{r, echo=F, warning=F, message=F}
+ggplot(match_data, aes(x = time)) +  # Replace `first_goal_time` with the appropriate column
+  geom_histogram(bins = 20, fill = "skyblue", color = "black") +
+  labs(
+    title = "Distribution of First Goal Times",
+    x = "Time of First Goal (Minutes)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+
+The bar graph will display the average goal conversion rate for different bins of shots on target. Each bar represents a range of shots on target, and the height of the bar indicates the average conversion rate for that range.
+This visualization allows us to see how conversion rates change as the number of shots on target increases.
+Conversely, if the conversion rate decreases or remains low despite an increase in shots on target, it may indicate inefficiencies in the attacking strategy or poor finishing skills.
+This analysis gives a small support for our project's hypothesis by demonstrating the relationship between offensive output and scoring efficiency. As there are more shots, effective shots are decreasing a little bit, which means that after first goal teams play more diffensivly.
+```{r, echo=F, warning=F, message=F}
+match_data %>%
+  dplyr::mutate(shot_bin = cut(total_shots_on_target, breaks = seq(0, max(total_shots_on_target, na.rm = TRUE), by = 5))) %>%
+  group_by(shot_bin) %>%
+  summarise(avg_conversion = mean(goal_conversion_rate, na.rm = TRUE)) %>%
+  ggplot(aes(x = shot_bin, y = avg_conversion)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  labs(
+    title = "Average Goal Conversion Rate by Shots on Target",
+    x = "Shots on Target (Binned)",
+    y = "Average Conversion Rate"
+  ) +
+  theme_minimal()
+```
+
+### Final results
+The mean goal conversion rate for home teams that scored first is 0.3546405, while for away teams, it is 0.3431553. This indicates that home teams tend to have a higher conversion rate when they score first, which could be attributed to factors such as home advantage, crowd support, or familiarity with the playing conditions.
+```{r, echo=F, warning=F, message=F}
+# T-test for goal conversion rate between home and away teams that scored first
+home_first_goal <- match_data %>%
+  filter(first_goal_wins == 1 & is_home_team == 1) %>%
+  pull(goal_conversion_rate)
+
+away_first_goal <- match_data %>%
+  filter(first_goal_wins == 1 & is_home_team == 0) %>%
+  pull(goal_conversion_rate)
+
+# Perform t-test
+t_test_result <- t.test(home_first_goal, away_first_goal)
+print(t_test_result)
+```
+
+The ANOVA results show that the factor first_goal_wins has a highly significant p-value and a very high F-value. This indicates that there is a strong statistical relationship between scoring the first goal and the goal conversion rate. In practical terms, this suggests that teams that score first are likely to have a higher goal conversion rate compared to those that do not score first.
+```{r, echo=F, warning=F, message=F}
+# ANOVA to compare goal conversion rate across different groups (e.g., home vs away)
+anova_result <- aov(goal_conversion_rate ~ first_goal_wins * is_home_team, data = match_data)
+summary(anova_result)
+```
+
+Since our hypothesis posits that scoring the first goal increases the probability of winning, the results of this Chi-squared test suggest that home teams may have a higher likelihood of scoring first. This aligns with the idea that home teams often have advantages, which can contribute to their success in scoring first and, consequently, winning matches.
+```{r, echo=F, warning=F, message=F}
+# Chi-squared test for independence between scoring first and home/away status
+chi_squared_result <- chisq.test(table(match_data$first_goal_wins, match_data$is_home_team))
+print(chi_squared_result)
+```
+
+# Conclusions and Summary
+
+The analysis examined key factors influencing match outcomes and goal conversion rates. Scoring the first goal significantly increases the probability of winning, especially when scored before the 50th minute. The linear regression model explained 88.29% of the variance in goal conversion rates, showing a slight negative correlation between total shots on target and efficiency. Total goals positively influenced goal conversion rates, while home team status had minimal impact. Temporal analysis indicated that scoring closer to the 40th minute enhances winning chances, and home teams generally have a higher predicted probability of winning. Visualization and ROC curve analysis highlighted the model's moderate predictive power and its ability to differentiate match outcomes beyond random chance.
+
+### Methodology 
+
+Data Filtering and Merging
+First Goal Analysis
+Boxplot Visualization
+Linear Regression Modeling
+Logistic Regression
+Odds Ratio Calculation
+ROC (Receiver Operating Characteristic) Curve Analysis
+Goal Conversion Rate Calculation
+
+
+### First Goal Significance
+Scoring the first goal significantly increases the probability of winning a match
+The analysis focused on first goals scored before the 50th minute to ensure a fair assessment
+A new column first_goal_wins was created to directly track this relationship
+
+### Statistical Model Insights
+
+The linear regression model explained 88.29% of the variance in goal conversion rates
+Total shots on target showed a slight negative correlation with goal conversion
+Total goals positively influenced goal conversion rates
+Home team status had minimal impact on goal conversion
+
+### Temporal Analysis of First Goals
+
+No significant outliers were detected in first goal timings
+Scoring closer to the 40th minute appears to increase winning probability
+Teams scoring very early (0-10 minutes) still maintain a >60% winning probability
+Home teams consistently showed a higher predicted probability of winning
+
+### Visualization Outcomes
+
+We used various plots to illustrate:
+
+Relationship between shots on target and goal conversion
+Impact of first goal timing on winning probability
+Odds ratios with confidence intervals for different predictors
+
+
+### Model Performance Evaluation
+
+ROC Curve Analysis:
+
+Provides a graphical representation of the binary classification model's performance
+Measures the model's ability to distinguish between different classes (winners/losers)
+The blue curve demonstrates moderate predictive power
+The curve's proximity to the top-left corner indicates some discriminative ability
+Diagonal line represents a random classifier baseline
+
+### Goal Conversion Rate Insights
+
+Defined as the ratio of total goals to total shots on target
+Serves as a key metric for team offensive efficiency
+Visualization shows the relationship between shots on target and goal conversion rate
+Each data point represents a single match's performance
+Helps understand the connection between:
+
+Number of shots on target
+Goal conversion efficiency
+Match outcome prediction
+
+### Predictive Model Characteristics
+
+The ROC curve suggests the model has:
+
+Moderate predictive power
+Ability to differentiate between match outcomes
+Some meaningful insights beyond random chance
+
+
+The Area Under the Curve (AUC), though not directly shown, would provide a quantitative measure of the model's performance
+A higher AUC would indicate stronger predictive capabilities
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
